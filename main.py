@@ -24,9 +24,12 @@ async def main(queries: list[str] | None = None):
     if queries is None:
         queries = ["python web scraping tutorial", "async python best practices"]
 
+    # Calculate daily limit (free tier = 100/day)
+    daily_limit = 100 if settings.google_free_tier_only else settings.google_requests_per_day
+
     print(f"Running pipeline with {len(queries)} queries...")
-    print(f"Crawler config: concurrency={settings.crawler.max_concurrency}, "
-          f"pruning={settings.crawler.use_pruning_filter}")
+    print(f"Google API: {'FREE TIER (100/day)' if settings.google_free_tier_only else f'{daily_limit}/day'}")
+    print(f"Crawler: concurrency={settings.crawler.max_concurrency}, pruning={settings.crawler.use_pruning_filter}")
     print("-" * 60)
 
     # Initialize clients
@@ -34,7 +37,7 @@ async def main(queries: list[str] | None = None):
         api_key=settings.google_api_key,
         cx=settings.google_cx,
         rate_limit_per_min=settings.google_requests_per_minute,
-        rate_limit_per_day=settings.google_requests_per_day,
+        rate_limit_per_day=daily_limit,
         max_results_per_query=settings.google_max_results_per_query,
     )
 
