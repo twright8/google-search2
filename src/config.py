@@ -38,6 +38,7 @@ class Settings(BaseSettings):
     google_requests_per_minute: int = 100
     google_requests_per_day: int = 10000
     google_max_results_per_query: int = 10
+    google_max_concurrent: int = 50  # Max parallel Google API requests
     google_free_tier_only: bool = False  # When True, limits to 100 req/day (free tier)
 
     # Nested configs

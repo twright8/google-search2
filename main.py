@@ -39,6 +39,7 @@ async def main(queries: list[str] | None = None):
         rate_limit_per_min=settings.google_requests_per_minute,
         rate_limit_per_day=daily_limit,
         max_results_per_query=settings.google_max_results_per_query,
+        max_concurrent=settings.google_max_concurrent,
     )
 
     crawler = ContentCrawler(settings.crawler)
