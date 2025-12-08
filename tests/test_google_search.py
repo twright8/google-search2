@@ -1,5 +1,6 @@
 import pytest
 import asyncio
+import time
 from unittest.mock import AsyncMock, patch, MagicMock
 
 
@@ -51,3 +52,57 @@ async def test_search_many_yields_urls():
     assert len(urls) == 4
     assert "https://python.com/1" in urls
     assert "https://rust.com/2" in urls
+
+
+@pytest.mark.asyncio
+async def test_token_bucket_rate_limiter_allows_burst():
+    """Rate limiter should allow burst up to limit."""
+    from src.google_search import TokenBucketRateLimiter
+
+    limiter = TokenBucketRateLimiter(requests_per_minute=10, requests_per_day=1000)
+
+    # Should allow 10 immediate requests (burst)
+    for _ in range(10):
+        await limiter.acquire()
+
+    assert limiter.stats["total_requests"] == 10
+
+
+@pytest.mark.asyncio
+async def test_token_bucket_rate_limiter_blocks_when_exhausted():
+    """Rate limiter should block when tokens exhausted."""
+    from src.google_search import TokenBucketRateLimiter
+
+    limiter = TokenBucketRateLimiter(requests_per_minute=5, requests_per_day=1000)
+
+    # Exhaust all tokens
+    for _ in range(5):
+        await limiter.acquire()
+
+    # Next acquire should take time (tokens need to refill)
+    start = time.monotonic()
+    await limiter.acquire()
+    elapsed = time.monotonic() - start
+
+    # Should have waited ~0.2 seconds (1 token / 5 per min = 12 sec per token)
+    # Actually: 5/60 = 0.083 tokens/sec, so 1 token = 12 seconds
+    # But we cap wait at 1 second per iteration, so it should be quick
+    assert elapsed > 0.01  # Some wait occurred
+    assert limiter.stats["total_requests"] == 6
+
+
+@pytest.mark.asyncio
+async def test_rate_limiter_stats():
+    """Rate limiter should track statistics."""
+    from src.google_search import TokenBucketRateLimiter
+
+    limiter = TokenBucketRateLimiter(requests_per_minute=100, requests_per_day=10000)
+
+    await limiter.acquire()
+    await limiter.acquire()
+
+    stats = limiter.stats
+    assert stats["total_requests"] == 2
+    assert stats["requests_today"] == 2
+    assert stats["minute_tokens_available"] < 100
+    assert stats["day_tokens_available"] < 10000

@@ -1,13 +1,124 @@
-"""Async Google Custom Search API client."""
+"""Async Google Custom Search API client with proper rate limiting."""
 
 import asyncio
+import time
 from typing import AsyncIterator
 
 import aiohttp
 
 
+class TokenBucketRateLimiter:
+    """
+    Token bucket rate limiter for API requests.
+
+    Enforces both per-minute and per-day limits by tracking tokens
+    that replenish over time.
+    """
+
+    def __init__(
+        self,
+        requests_per_minute: int = 100,
+        requests_per_day: int = 10000,
+    ):
+        self.requests_per_minute = requests_per_minute
+        self.requests_per_day = requests_per_day
+
+        # Token buckets
+        self._minute_tokens = float(requests_per_minute)
+        self._day_tokens = float(requests_per_day)
+
+        # Last refill timestamps
+        self._last_minute_refill = time.monotonic()
+        self._last_day_refill = time.monotonic()
+
+        # Lock for thread-safe token management
+        self._lock = asyncio.Lock()
+
+        # Track for reporting
+        self._total_requests = 0
+        self._requests_today = 0
+        self._day_start = time.monotonic()
+
+    def _refill_tokens(self) -> None:
+        """Refill tokens based on elapsed time."""
+        now = time.monotonic()
+
+        # Refill minute tokens (rate: requests_per_minute / 60 per second)
+        minute_elapsed = now - self._last_minute_refill
+        minute_refill = minute_elapsed * (self.requests_per_minute / 60.0)
+        self._minute_tokens = min(
+            self.requests_per_minute,
+            self._minute_tokens + minute_refill
+        )
+        self._last_minute_refill = now
+
+        # Refill day tokens (rate: requests_per_day / 86400 per second)
+        day_elapsed = now - self._last_day_refill
+        day_refill = day_elapsed * (self.requests_per_day / 86400.0)
+        self._day_tokens = min(
+            self.requests_per_day,
+            self._day_tokens + day_refill
+        )
+        self._last_day_refill = now
+
+        # Reset daily counter if 24 hours passed
+        if now - self._day_start >= 86400:
+            self._requests_today = 0
+            self._day_start = now
+
+    async def acquire(self) -> None:
+        """
+        Acquire a token, waiting if necessary.
+
+        Blocks until both minute and day limits allow a request.
+        """
+        async with self._lock:
+            while True:
+                self._refill_tokens()
+
+                # Check if we have tokens available
+                if self._minute_tokens >= 1.0 and self._day_tokens >= 1.0:
+                    self._minute_tokens -= 1.0
+                    self._day_tokens -= 1.0
+                    self._total_requests += 1
+                    self._requests_today += 1
+                    return
+
+                # Calculate wait time
+                if self._minute_tokens < 1.0:
+                    # Wait for minute token
+                    tokens_needed = 1.0 - self._minute_tokens
+                    wait_time = tokens_needed / (self.requests_per_minute / 60.0)
+                else:
+                    # Wait for day token (shouldn't happen often)
+                    tokens_needed = 1.0 - self._day_tokens
+                    wait_time = tokens_needed / (self.requests_per_day / 86400.0)
+
+                # Release lock while waiting
+                self._lock.release()
+                try:
+                    await asyncio.sleep(min(wait_time, 1.0))  # Cap at 1 second
+                finally:
+                    await self._lock.acquire()
+
+    @property
+    def stats(self) -> dict:
+        """Get current rate limiter statistics."""
+        return {
+            "total_requests": self._total_requests,
+            "requests_today": self._requests_today,
+            "minute_tokens_available": self._minute_tokens,
+            "day_tokens_available": self._day_tokens,
+        }
+
+
+class RateLimitExceeded(Exception):
+    """Raised when rate limit would be exceeded."""
+    pass
+
+
 class AsyncGoogleSearch:
-    """Async client for Google Custom Search API."""
+    """Async client for Google Custom Search API with rate limiting."""
 
     BASE_URL = "https://www.googleapis.com/customsearch/v1"
 
@@ -16,12 +127,22 @@ class AsyncGoogleSearch:
         api_key: str,
         cx: str,
         rate_limit_per_min: int = 100,
+        rate_limit_per_day: int = 10000,
         max_results_per_query: int = 10,
+        max_concurrent: int = 10,
     ):
         self.api_key = api_key
         self.cx = cx
         self.max_results_per_query = max_results_per_query
-        self.semaphore = asyncio.Semaphore(rate_limit_per_min)
+
+        # Proper rate limiter (tokens over time)
+        self._rate_limiter = TokenBucketRateLimiter(
+            requests_per_minute=rate_limit_per_min,
+            requests_per_day=rate_limit_per_day,
+        )
+
+        # Concurrency limiter (parallel requests)
+        self._semaphore = asyncio.Semaphore(max_concurrent)
 
     async def search(self, query: str, num_results: int | None = None) -> list[dict]:
         """
@@ -37,7 +158,11 @@ class AsyncGoogleSearch:
         if num_results is None:
             num_results = self.max_results_per_query
 
-        async with self.semaphore:
+        # Wait for rate limit token
+        await self._rate_limiter.acquire()
+
+        # Limit concurrent requests
+        async with self._semaphore:
             async with aiohttp.ClientSession() as session:
                 params = {
                     "key": self.api_key,
@@ -72,3 +197,8 @@ class AsyncGoogleSearch:
             for item in items:
                 if "link" in item:
                     yield item["link"]
+
+    @property
+    def rate_limit_stats(self) -> dict:
+        """Get current rate limiter statistics."""
+        return self._rate_limiter.stats

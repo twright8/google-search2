@@ -34,6 +34,7 @@ async def main(queries: list[str] | None = None):
         api_key=settings.google_api_key,
         cx=settings.google_cx,
         rate_limit_per_min=settings.google_requests_per_minute,
+        rate_limit_per_day=settings.google_requests_per_day,
         max_results_per_query=settings.google_max_results_per_query,
     )
 
