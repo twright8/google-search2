@@ -48,6 +48,7 @@ class ContentCrawler:
         return CrawlerRunConfig(
             cache_mode=CacheMode.BYPASS,
             markdown_generator=md_generator,
+            stream=True,  # Stream results as they complete
         )
 
     def _build_dispatcher(self) -> MemoryAdaptiveDispatcher:
@@ -90,13 +91,12 @@ class ContentCrawler:
         dispatcher = self._build_dispatcher()
 
         async with AsyncWebCrawler(config=browser_config) as crawler:
-            results = await crawler.arun_many(
+            # stream=True means arun_many returns async generator, yields as each completes
+            async for result in await crawler.arun_many(
                 urls=urls,
                 config=run_config,
                 dispatcher=dispatcher,
-            )
-
-            for result in results:
+            ):
                 if result.success:
                     if use_raw_markdown:
                         content = result.markdown.raw_markdown
