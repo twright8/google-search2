@@ -130,10 +130,18 @@ class AsyncGoogleSearch:
         rate_limit_per_day: int = 10000,
         max_results_per_query: int = 10,
         max_concurrent: int = 10,
+        retry_max: int = 3,
+        retry_base_delay: float = 1.0,
+        retry_max_delay: float = 30.0,
     ):
         self.api_key = api_key
         self.cx = cx
         self.max_results_per_query = max_results_per_query
+
+        # Retry settings
+        self.retry_max = retry_max
+        self.retry_base_delay = retry_base_delay
+        self.retry_max_delay = retry_max_delay
 
         # Proper rate limiter (tokens over time)
         self._rate_limiter = TokenBucketRateLimiter(
@@ -144,9 +152,32 @@ class AsyncGoogleSearch:
         # Concurrency limiter (parallel requests)
         self._semaphore = asyncio.Semaphore(max_concurrent)
 
+        # Reusable session (created lazily)
+        self._session: aiohttp.ClientSession | None = None
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        """Get or create the shared aiohttp session."""
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession()
+        return self._session
+
+    async def close(self) -> None:
+        """Close the shared session."""
+        if self._session and not self._session.closed:
+            await self._session.close()
+            self._session = None
+
+    async def __aenter__(self) -> "AsyncGoogleSearch":
+        """Async context manager entry."""
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        """Async context manager exit."""
+        await self.close()
+
     async def search(self, query: str, num_results: int | None = None) -> list[dict]:
         """
-        Execute a single search query.
+        Execute a single search query with retry logic.
 
         Args:
             query: Search query string
@@ -154,6 +185,10 @@ class AsyncGoogleSearch:
 
         Returns:
             List of result items with 'title', 'link', 'snippet'
+
+        Raises:
+            aiohttp.ClientResponseError: On non-retryable errors (4xx)
+            aiohttp.ClientError: On network errors after all retries exhausted
         """
         if num_results is None:
             num_results = self.max_results_per_query
@@ -163,17 +198,64 @@ class AsyncGoogleSearch:
 
         # Limit concurrent requests
         async with self._semaphore:
-            async with aiohttp.ClientSession() as session:
-                params = {
-                    "key": self.api_key,
-                    "cx": self.cx,
-                    "q": query,
-                    "num": min(num_results, 10),  # API max is 10
-                }
-                async with session.get(self.BASE_URL, params=params) as response:
-                    response.raise_for_status()
-                    data = await response.json()
-                    return data.get("items", [])
+            session = await self._get_session()
+            params = {
+                "key": self.api_key,
+                "cx": self.cx,
+                "q": query,
+                "num": min(num_results, 10),  # API max is 10
+            }
+
+            last_exception: Exception | None = None
+            for attempt in range(self.retry_max + 1):
+                try:
+                    async with session.get(self.BASE_URL, params=params) as response:
+                        # Don't retry client errors (4xx) - these are not transient
+                        if 400 <= response.status < 500:
+                            response.raise_for_status()
+
+                        # Retry server errors (5xx)
+                        if response.status >= 500:
+                            raise aiohttp.ClientResponseError(
+                                response.request_info,
+                                response.history,
+                                status=response.status,
+                                message=f"Server error {response.status}",
+                            )
+
+                        response.raise_for_status()
+                        data = await response.json()
+                        return data.get("items", [])
+
+                except aiohttp.ClientResponseError as e:
+                    # Don't retry 4xx errors - they're not transient
+                    if e.status is not None and 400 <= e.status < 500:
+                        raise
+                    last_exception = e
+                    if attempt < self.retry_max:
+                        delay = min(
+                            self.retry_base_delay * (2 ** attempt),
+                            self.retry_max_delay,
+                        )
+                        await asyncio.sleep(delay)
+                    else:
+                        raise
+
+                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                    last_exception = e
+                    if attempt < self.retry_max:
+                        delay = min(
+                            self.retry_base_delay * (2 ** attempt),
+                            self.retry_max_delay,
+                        )
+                        await asyncio.sleep(delay)
+                    else:
+                        raise
+
+            # Should not reach here, but satisfy type checker
+            if last_exception:
+                raise last_exception
+            return []
 
     async def search_many(
         self,

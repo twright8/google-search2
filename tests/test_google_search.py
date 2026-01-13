@@ -19,14 +19,16 @@ async def test_search_returns_items():
     with patch("aiohttp.ClientSession") as mock_session_class:
         mock_session = AsyncMock()
         mock_response_obj = AsyncMock()
+        mock_response_obj.status = 200
         mock_response_obj.json = AsyncMock(return_value=mock_response)
         mock_response_obj.raise_for_status = MagicMock()
         mock_session.get = MagicMock(return_value=AsyncMock(__aenter__=AsyncMock(return_value=mock_response_obj)))
-        mock_session_class.return_value.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_session_class.return_value.__aexit__ = AsyncMock()
+        mock_session.closed = False
+        mock_session_class.return_value = mock_session
 
         client = AsyncGoogleSearch(api_key="test", cx="test_cx")
         results = await client.search("python")
+        await client.close()
 
         assert len(results) == 2
         assert results[0]["link"] == "https://example1.com"
@@ -106,3 +108,132 @@ async def test_rate_limiter_stats():
     assert stats["requests_today"] == 2
     assert stats["minute_tokens_available"] < 100
     assert stats["day_tokens_available"] < 10000
+
+
+@pytest.mark.asyncio
+async def test_search_retries_on_server_error():
+    """Search should retry on 5xx errors with exponential backoff."""
+    from src.google_search import AsyncGoogleSearch
+    import aiohttp
+
+    call_count = 0
+
+    def mock_get(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+
+        mock_response = AsyncMock()
+        mock_response.request_info = MagicMock()
+        mock_response.history = []
+
+        if call_count < 3:
+            # First 2 calls return 500
+            mock_response.status = 500
+        else:
+            # Third call succeeds
+            mock_response.status = 200
+            mock_response.json = AsyncMock(return_value={"items": [{"link": "https://example.com"}]})
+            mock_response.raise_for_status = MagicMock()
+
+        return AsyncMock(__aenter__=AsyncMock(return_value=mock_response))
+
+    with patch("aiohttp.ClientSession") as mock_session_class:
+        mock_session = AsyncMock()
+        mock_session.get = mock_get
+        mock_session.closed = False
+        mock_session_class.return_value = mock_session
+
+        client = AsyncGoogleSearch(
+            api_key="test",
+            cx="test_cx",
+            retry_max=3,
+            retry_base_delay=0.01,  # Fast for testing
+        )
+        results = await client.search("python")
+        await client.close()
+
+        assert call_count == 3  # Retried twice, succeeded on third
+        assert len(results) == 1
+
+
+@pytest.mark.asyncio
+async def test_search_does_not_retry_on_client_error():
+    """Search should NOT retry on 4xx errors (e.g., quota exceeded)."""
+    from src.google_search import AsyncGoogleSearch
+    import aiohttp
+
+    call_count = 0
+
+    def mock_get(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+
+        mock_response = AsyncMock()
+        mock_response.status = 403  # Forbidden / quota exceeded
+        mock_response.raise_for_status = MagicMock(
+            side_effect=aiohttp.ClientResponseError(
+                MagicMock(), (), status=403, message="Forbidden"
+            )
+        )
+
+        return AsyncMock(__aenter__=AsyncMock(return_value=mock_response))
+
+    with patch("aiohttp.ClientSession") as mock_session_class:
+        mock_session = AsyncMock()
+        mock_session.get = mock_get
+        mock_session.closed = False
+        mock_session_class.return_value = mock_session
+
+        client = AsyncGoogleSearch(
+            api_key="test",
+            cx="test_cx",
+            retry_max=3,
+            retry_base_delay=0.01,
+        )
+
+        with pytest.raises(aiohttp.ClientResponseError):
+            await client.search("python")
+
+        await client.close()
+
+        assert call_count == 1  # No retries on 4xx
+
+
+@pytest.mark.asyncio
+async def test_search_exhausts_retries():
+    """Search should raise after exhausting all retries."""
+    from src.google_search import AsyncGoogleSearch
+    import aiohttp
+
+    call_count = 0
+
+    def mock_get(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+
+        mock_response = AsyncMock()
+        mock_response.status = 500
+        mock_response.request_info = MagicMock()
+        mock_response.history = []
+
+        return AsyncMock(__aenter__=AsyncMock(return_value=mock_response))
+
+    with patch("aiohttp.ClientSession") as mock_session_class:
+        mock_session = AsyncMock()
+        mock_session.get = mock_get
+        mock_session.closed = False
+        mock_session_class.return_value = mock_session
+
+        client = AsyncGoogleSearch(
+            api_key="test",
+            cx="test_cx",
+            retry_max=2,
+            retry_base_delay=0.01,
+        )
+
+        with pytest.raises(aiohttp.ClientResponseError):
+            await client.search("python")
+
+        await client.close()
+
+        assert call_count == 3  # Initial + 2 retries

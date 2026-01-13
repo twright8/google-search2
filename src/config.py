@@ -17,6 +17,17 @@ class CrawlerConfig(BaseSettings):
     pruning_threshold: float = 0.3
     headless: bool = True
 
+    # Anti-bot protection
+    browser_type: str = "chromium"  # "chromium" or "undetected"
+    enable_stealth: bool = True  # Use playwright-stealth patches
+    dismiss_cookie_consent: bool = True  # Auto-click cookie consent buttons
+    enable_magic_mode: bool = False  # Extra anti-bot simulation (adds some overhead)
+
+    # Content filtering
+    excluded_tags: list[str] = ["nav", "footer", "header", "aside", "advertisement"]
+    word_count_threshold: int = 20
+    exclude_external_links: bool = True
+
     model_config = {"env_prefix": "CRAWLER_"}
 
 
@@ -40,6 +51,11 @@ class Settings(BaseSettings):
     google_max_results_per_query: int = 10
     google_max_concurrent: int = 50  # Max parallel Google API requests
     google_free_tier_only: bool = False  # When True, limits to 100 req/day (free tier)
+
+    # Google Search retry settings
+    google_retry_max: int = 3
+    google_retry_base_delay: float = 1.0
+    google_retry_max_delay: float = 30.0
 
     # Nested configs
     crawler: CrawlerConfig = Field(default_factory=CrawlerConfig)
